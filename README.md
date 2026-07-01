@@ -28,6 +28,32 @@ rate-limited ones, drop the dead ones, spread load, re-check periodically.
   `poolctl` injects the key, forwards, and retries with a different key on a
   rate-limit or auth failure — transparent to the client.
 
+## Demo
+
+Health-check a pool, then serve it as a gateway that injects and rotates keys:
+
+```console
+$ poolctl check -c pool.yaml
+ID                   STATUS  LATENCY
+t8ca5f15f            live        3ms
+t5347ccaf            live        2ms
+t753be07d            live        1ms
+3/3 live
+
+$ poolctl proxy -c pool.yaml     # proxy :8899, API :8787, metrics :9899
+
+# four client requests through the proxy — the upstream key rotates:
+req1 -> key_alpha
+req2 -> key_bravo
+req3 -> key_charlie
+req4 -> key_alpha
+
+$ curl -s :9899/metrics | grep poolctl_
+poolctl_tokens{status="live"} 3
+poolctl_requests_total 4
+poolctl_proxy_retries_total 0
+```
+
 ## Install
 
 ```sh
