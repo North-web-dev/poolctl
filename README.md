@@ -1,5 +1,8 @@
 # poolctl
 
+[![CI](https://github.com/North-web-dev/poolctl/actions/workflows/ci.yml/badge.svg)](https://github.com/North-web-dev/poolctl/actions/workflows/ci.yml) [![Go Report Card](https://goreportcard.com/badge/github.com/North-web-dev/poolctl)](https://goreportcard.com/report/github.com/North-web-dev/poolctl) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/North-web-dev/poolctl?sort=semver)](https://github.com/North-web-dev/poolctl/releases)
+
+
 A small daemon + CLI for managing a pool of tokens or accounts: health checks,
 rotation, per-token cooldown, optional refresh, and an HTTP API that hands out a
 healthy token on demand. It can also run as a **passthrough reverse proxy** that
