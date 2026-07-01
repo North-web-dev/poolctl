@@ -1,4 +1,5 @@
-# one token per line: "id,token" or just "token"
-key1,sk-aaaaaaaaaaaa
-key2,sk-bbbbbbbbbbbb
+# one token per line: "id,token", just "token", or "id,token,weight"
+# (weight is used only by rotation: weighted; a missing weight is 1)
+key1,sk-aaaaaaaaaaaa,5
+key2,sk-bbbbbbbbbbbb,1
 sk-cccccccccccc

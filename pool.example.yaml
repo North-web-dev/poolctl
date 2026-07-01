@@ -1,6 +1,6 @@
 # poolctl example config
 tokens_file: tokens.txt
-rotation: lru            # lru | round_robin | random
+rotation: lru            # lru | round_robin | random | weighted
 cooldown_sec: 30         # rest after take / after a failure
 recheck_interval_sec: 300
 
@@ -25,4 +25,19 @@ proxy: ""                # optional proxy for http checks
 server:
   addr: ":8787"
   api_key: ""            # if set, clients must send X-API-Key
+
+# upstream:              # LLM / API-gateway mode — run `poolctl proxy`
+#   enabled: true
+#   listen: ":8080"
+#   base_url: "https://api.openai.com"
+#   auth_header: "Authorization"
+#   auth_template: "Bearer {token}"
+#   retry_on: [401, 403, 429, 500, 502, 503, 504]
+#   max_retries: 2       # retry with a different token on the statuses above
+#   quarantine_sec: 300  # rest after a 401/403 (bad key)
+#   cooldown_sec: 30     # rest after a 429/5xx (rate limit); defaults to cooldown_sec
+
+# metrics:               # Prometheus text endpoint
+#   addr: ":9090"
+
 state_file: pool_state.json

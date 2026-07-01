@@ -18,20 +18,25 @@ import (
 type Status string
 
 const (
-	Unknown Status = "unknown" // not yet checked
-	Live    Status = "live"    // last check passed
-	Dead    Status = "dead"    // last check or use failed
+	Unknown     Status = "unknown"     // not yet checked
+	Live        Status = "live"        // last check passed
+	Dead        Status = "dead"        // last check or use failed
+	Quarantined Status = "quarantined" // pulled after a hard auth failure (401/403)
 )
 
 // Token holds a value and its runtime state. Value is never persisted.
 type Token struct {
 	ID           string    `json:"id"`
 	Value        string    `json:"-"`
+	Weight       int       `json:"weight"`
 	Status       Status    `json:"status"`
 	LastCheck    time.Time `json:"last_check"`
 	LastUsed     time.Time `json:"last_used"`
 	CoolingUntil time.Time `json:"cooling_until"`
 	Fails        int       `json:"fails"`
+	Requests     int64     `json:"requests"`
+	Errors       int64     `json:"errors"`
+	LastStatus   int       `json:"last_status"`
 }
 
 // Lease is a token handed out by Take.
@@ -96,13 +101,14 @@ func (p *Pool) SetTokens(lines []string) {
 		if ln == "" || strings.HasPrefix(ln, "#") {
 			continue
 		}
-		id, val := parseLine(ln)
+		id, val, weight := parseLine(ln)
 		seen[id] = true
 		if t, ok := p.byID[id]; ok {
 			t.Value = val
+			t.Weight = weight
 			continue
 		}
-		t := &Token{ID: id, Value: val, Status: Unknown}
+		t := &Token{ID: id, Value: val, Weight: weight, Status: Unknown}
 		p.byID[id] = t
 		p.order = append(p.order, t)
 	}
@@ -117,13 +123,27 @@ func (p *Pool) SetTokens(lines []string) {
 	p.order = kept
 }
 
-func parseLine(ln string) (id, val string) {
-	if c := strings.IndexByte(ln, ','); c >= 0 {
-		return strings.TrimSpace(ln[:c]), strings.TrimSpace(ln[c+1:])
+// parseLine reads "id,value", "id,value,weight", or a bare "value" (id derived
+// from a value hash). A trailing integer field is taken as the token's weight
+// for weighted rotation; anything else is folded back into the value, so values
+// containing commas still round-trip.
+func parseLine(ln string) (id, val string, weight int) {
+	weight = 1
+	parts := strings.Split(ln, ",")
+	if len(parts) >= 3 {
+		if w, err := strconv.Atoi(strings.TrimSpace(parts[len(parts)-1])); err == nil {
+			if w > 0 {
+				weight = w
+			}
+			parts = parts[:len(parts)-1]
+		}
+	}
+	if len(parts) >= 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(strings.Join(parts[1:], ",")), weight
 	}
 	h := fnv.New32a()
 	h.Write([]byte(ln))
-	return "t" + strconv.FormatUint(uint64(h.Sum32()), 16), ln
+	return "t" + strconv.FormatUint(uint64(h.Sum32()), 16), ln, weight
 }
 
 // Take returns an available token per the rotation policy and puts it on
@@ -134,7 +154,7 @@ func (p *Pool) Take() (Lease, bool) {
 	now := p.now()
 	var cand []*Token
 	for _, t := range p.order {
-		if t.Status != Dead && !now.Before(t.CoolingUntil) {
+		if t.Status != Dead && t.Status != Quarantined && !now.Before(t.CoolingUntil) {
 			cand = append(cand, t)
 		}
 	}
@@ -147,6 +167,8 @@ func (p *Pool) Take() (Lease, bool) {
 		pick = p.roundRobin(cand)
 	case "random":
 		pick = cand[p.rng.Intn(len(cand))]
+	case "weighted":
+		pick = p.weighted(cand)
 	default: // lru
 		pick = cand[0]
 		for _, t := range cand[1:] {
@@ -158,6 +180,31 @@ func (p *Pool) Take() (Lease, bool) {
 	pick.LastUsed = now
 	pick.CoolingUntil = now.Add(p.cooldown)
 	return Lease{ID: pick.ID, Value: pick.Value}, true
+}
+
+// weighted picks a candidate with probability proportional to its weight, so
+// higher-quota keys carry more traffic. Weights below 1 count as 1.
+func (p *Pool) weighted(cand []*Token) *Token {
+	total := 0
+	for _, t := range cand {
+		if t.Weight < 1 {
+			total++
+		} else {
+			total += t.Weight
+		}
+	}
+	r := p.rng.Intn(total)
+	for _, t := range cand {
+		w := t.Weight
+		if w < 1 {
+			w = 1
+		}
+		if r < w {
+			return t
+		}
+		r -= w
+	}
+	return cand[len(cand)-1]
 }
 
 // roundRobin advances the cursor to the next candidate in insertion order.
@@ -192,7 +239,56 @@ func (p *Pool) Release(id string, ok bool) {
 	}
 }
 
-// MarkChecked records a health-check outcome. A live result revives a token.
+// Penalize keeps a token alive but rests it for d (on top of any current
+// cooldown). Use for soft failures such as 429 or 5xx, where the key is fine
+// but should back off briefly.
+func (p *Pool) Penalize(id string, d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t := p.byID[id]
+	if t == nil {
+		return
+	}
+	t.Fails++
+	until := p.now().Add(d)
+	if until.After(t.CoolingUntil) {
+		t.CoolingUntil = until
+	}
+}
+
+// Quarantine pulls a token out of rotation for d after a hard failure (e.g. a
+// 401/403 auth rejection). A subsequent passing health check revives it.
+func (p *Pool) Quarantine(id string, d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t := p.byID[id]
+	if t == nil {
+		return
+	}
+	t.Fails++
+	t.Status = Quarantined
+	t.CoolingUntil = p.now().Add(d)
+}
+
+// RecordUse accounts a request made with a token: it bumps the request count,
+// records the last status, and counts anything >=400 (or 0 for a transport
+// error) as an error.
+func (p *Pool) RecordUse(id string, status int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	t := p.byID[id]
+	if t == nil {
+		return
+	}
+	t.Requests++
+	t.LastStatus = status
+	if status == 0 || status >= 400 {
+		t.Errors++
+	}
+}
+
+// MarkChecked records a health-check outcome. A live result revives a token,
+// including one in quarantine.
 func (p *Pool) MarkChecked(id string, live bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -204,7 +300,7 @@ func (p *Pool) MarkChecked(id string, live bool) {
 	if live {
 		t.Status = Live
 		t.Fails = 0
-	} else {
+	} else if t.Status != Quarantined {
 		t.Status = Dead
 	}
 }
@@ -233,22 +329,27 @@ func (p *Pool) Entries() []Lease {
 
 // TokenView is a persistence/reporting projection of a Token.
 type TokenView struct {
-	ID        string    `json:"id"`
-	Status    Status    `json:"status"`
-	LastCheck time.Time `json:"last_check"`
-	LastUsed  time.Time `json:"last_used"`
-	Cooling   bool      `json:"cooling"`
-	Fails     int       `json:"fails"`
+	ID         string    `json:"id"`
+	Weight     int       `json:"weight"`
+	Status     Status    `json:"status"`
+	LastCheck  time.Time `json:"last_check"`
+	LastUsed   time.Time `json:"last_used"`
+	Cooling    bool      `json:"cooling"`
+	Fails      int       `json:"fails"`
+	Requests   int64     `json:"requests"`
+	Errors     int64     `json:"errors"`
+	LastStatus int       `json:"last_status"`
 }
 
 // Snapshot is an aggregate + per-token view of the pool.
 type Snapshot struct {
-	Total   int         `json:"total"`
-	Live    int         `json:"live"`
-	Dead    int         `json:"dead"`
-	Unknown int         `json:"unknown"`
-	Cooling int         `json:"cooling"`
-	Tokens  []TokenView `json:"tokens"`
+	Total       int         `json:"total"`
+	Live        int         `json:"live"`
+	Dead        int         `json:"dead"`
+	Unknown     int         `json:"unknown"`
+	Quarantined int         `json:"quarantined"`
+	Cooling     int         `json:"cooling"`
+	Tokens      []TokenView `json:"tokens"`
 }
 
 // Status returns aggregate counters and a per-token view.
@@ -267,12 +368,15 @@ func (p *Pool) Status() Snapshot {
 			s.Live++
 		case Dead:
 			s.Dead++
+		case Quarantined:
+			s.Quarantined++
 		default:
 			s.Unknown++
 		}
 		s.Tokens = append(s.Tokens, TokenView{
-			ID: t.ID, Status: t.Status, LastCheck: t.LastCheck,
+			ID: t.ID, Weight: t.Weight, Status: t.Status, LastCheck: t.LastCheck,
 			LastUsed: t.LastUsed, Cooling: cooling, Fails: t.Fails,
+			Requests: t.Requests, Errors: t.Errors, LastStatus: t.LastStatus,
 		})
 	}
 	return s
@@ -326,6 +430,9 @@ func (p *Pool) LoadState() error {
 			t.LastUsed = s.LastUsed
 			t.CoolingUntil = s.CoolingUntil
 			t.Fails = s.Fails
+			t.Requests = s.Requests
+			t.Errors = s.Errors
+			t.LastStatus = s.LastStatus
 		}
 	}
 	return nil

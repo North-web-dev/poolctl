@@ -18,7 +18,9 @@ import (
 
 	"github.com/North-web-dev/poolctl/internal/check"
 	"github.com/North-web-dev/poolctl/internal/config"
+	"github.com/North-web-dev/poolctl/internal/metrics"
 	"github.com/North-web-dev/poolctl/internal/pool"
+	"github.com/North-web-dev/poolctl/internal/proxy"
 	"github.com/North-web-dev/poolctl/internal/server"
 )
 
@@ -26,6 +28,7 @@ const usage = `poolctl - token/account pool manager
 
 usage:
   poolctl serve  -c pool.yaml   run the daemon (health loop + HTTP API)
+  poolctl proxy  -c pool.yaml   run the daemon + passthrough reverse proxy
   poolctl check  -c pool.yaml   check every token once and print a table
   poolctl status -c pool.yaml   query a running daemon's /status
   poolctl take   -c pool.yaml   take one token from a running daemon
@@ -43,6 +46,8 @@ func main() {
 	switch cmd {
 	case "serve":
 		err = runServe(cfgPath)
+	case "proxy":
+		err = runProxy(cfgPath)
 	case "check":
 		err = runCheck(cfgPath)
 	case "status":
@@ -116,26 +121,95 @@ func runServe(cfgPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	reg := metrics.New(p)
 	reload := func() error { return loadTokens(p, cfg.TokensFile) }
-	srv := &http.Server{Addr: cfg.Server.Addr, Handler: server.New(p, cfg.Server.APIKey, reload).Handler()}
+	api := server.New(p, cfg.Server.APIKey, reload).WithMetrics(reg.Handler())
+	srvs := []*http.Server{{Addr: cfg.Server.Addr, Handler: api.Handler()}}
 
 	go recheckLoop(ctx, p, checker, cfg)
 	go saveLoop(ctx, p)
 
+	fmt.Printf("poolctl serving on %s (%d tokens, rotation=%s)\n", cfg.Server.Addr, len(p.Entries()), cfg.Rotation)
+	listen(srvs[0], "api", stop)
+
+	<-ctx.Done()
+	shutdown(srvs)
+	return p.Save()
+}
+
+// runProxy runs the full daemon plus the passthrough reverse proxy: the control
+// API on server.addr, the proxy on upstream.listen, and (if set) a dedicated
+// metrics listener on metrics.addr.
+func runProxy(cfgPath string) error {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	if !cfg.Upstream.Enabled {
+		return fmt.Errorf("proxy mode needs upstream.enabled: true in %s", cfgPath)
+	}
+	p, err := buildPool(cfg)
+	if err != nil {
+		return err
+	}
+	checker, err := check.New(cfg.Check, cfg.Proxy)
+	if err != nil {
+		return err
+	}
+	reg := metrics.New(p)
+	px, err := proxy.New(p, cfg.Upstream, reg)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	reload := func() error { return loadTokens(p, cfg.TokensFile) }
+	api := server.New(p, cfg.Server.APIKey, reload).WithMetrics(reg.Handler())
+	srvs := []*http.Server{
+		{Addr: cfg.Server.Addr, Handler: api.Handler()},
+		{Addr: cfg.Upstream.Listen, Handler: px},
+	}
+	if cfg.Metrics.Addr != "" && cfg.Metrics.Addr != cfg.Server.Addr {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/metrics", reg.Handler())
+		srvs = append(srvs, &http.Server{Addr: cfg.Metrics.Addr, Handler: mux})
+	}
+
+	go recheckLoop(ctx, p, checker, cfg)
+	go saveLoop(ctx, p)
+
+	fmt.Printf("poolctl proxy: upstream %s → %s | api %s (%d tokens, rotation=%s)\n",
+		cfg.Upstream.Listen, cfg.Upstream.BaseURL, cfg.Server.Addr, len(p.Entries()), cfg.Rotation)
+	for i, s := range srvs {
+		listen(s, fmt.Sprintf("server[%d]", i), stop)
+	}
+
+	<-ctx.Done()
+	shutdown(srvs)
+	return p.Save()
+}
+
+// listen starts srv in the background and stops the daemon if it exits with an
+// unexpected error.
+func listen(srv *http.Server, name string, stop context.CancelFunc) {
 	go func() {
-		fmt.Printf("poolctl serving on %s (%d tokens, rotation=%s)\n", cfg.Server.Addr, len(p.Entries()), cfg.Rotation)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintln(os.Stderr, "server:", err)
+			fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
 			stop()
 		}
 	}()
+}
 
-	<-ctx.Done()
+// shutdown gracefully drains every server with a shared deadline.
+func shutdown(srvs []*http.Server) {
 	fmt.Println("shutting down")
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(sctx)
-	return p.Save()
+	for _, s := range srvs {
+		_ = s.Shutdown(sctx)
+	}
 }
 
 // recheckLoop validates every token immediately and on an interval, attempting
@@ -282,8 +356,8 @@ func runStatus(cfgPath string) error {
 	if err := daemonGET(cfg, "/status", &s); err != nil {
 		return err
 	}
-	fmt.Printf("total %d | live %d | dead %d | unknown %d | cooling %d\n",
-		s.Total, s.Live, s.Dead, s.Unknown, s.Cooling)
+	fmt.Printf("total %d | live %d | dead %d | quarantined %d | unknown %d | cooling %d\n",
+		s.Total, s.Live, s.Dead, s.Quarantined, s.Unknown, s.Cooling)
 	return nil
 }
 

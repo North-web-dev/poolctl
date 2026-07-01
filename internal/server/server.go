@@ -11,14 +11,21 @@ import (
 
 // Server serves take/release/status/reload over HTTP.
 type Server struct {
-	pool   *pool.Pool
-	apiKey string
-	reload func() error
+	pool    *pool.Pool
+	apiKey  string
+	reload  func() error
+	metrics http.HandlerFunc
 }
 
 // New builds a Server. reload may be nil.
 func New(p *pool.Pool, apiKey string, reload func() error) *Server {
 	return &Server{pool: p, apiKey: apiKey, reload: reload}
+}
+
+// WithMetrics mounts an unauthenticated /metrics handler (Prometheus scrape).
+func (s *Server) WithMetrics(h http.HandlerFunc) *Server {
+	s.metrics = h
+	return s
 }
 
 // Handler returns the configured HTTP mux.
@@ -28,6 +35,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/release", s.auth(s.handleRelease))
 	mux.HandleFunc("/status", s.auth(s.handleStatus))
 	mux.HandleFunc("/reload", s.auth(s.handleReload))
+	if s.metrics != nil {
+		mux.HandleFunc("/metrics", s.metrics)
+	}
 	return mux
 }
 
