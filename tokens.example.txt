@@ -1,0 +1,4 @@
+# one token per line: "id,token" or just "token"
+key1,sk-aaaaaaaaaaaa
+key2,sk-bbbbbbbbbbbb
+sk-cccccccccccc

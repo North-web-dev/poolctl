@@ -1,0 +1,28 @@
+# poolctl example config
+tokens_file: tokens.txt
+rotation: lru            # lru | round_robin | random
+cooldown_sec: 30         # rest after take / after a failure
+recheck_interval_sec: 300
+
+check:
+  type: http             # http | command
+  url: "https://api.example.com/me"
+  method: GET
+  headers:
+    Authorization: "Bearer {token}"
+  success_status: [200]
+  timeout_sec: 15
+
+# refresh:               # optional OAuth-style refresh when a check fails
+#   enabled: true
+#   url: "https://auth.example.com/token"
+#   method: POST
+#   headers: { Content-Type: "application/json" }
+#   body: '{"grant_type":"refresh_token","refresh_token":"{token}"}'
+#   token_field: access_token
+
+proxy: ""                # optional proxy for http checks
+server:
+  addr: ":8787"
+  api_key: ""            # if set, clients must send X-API-Key
+state_file: pool_state.json

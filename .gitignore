@@ -1,0 +1,7 @@
+/poolctl
+/poolctl_check
+*.exe
+pool_state.json
+*.local
+tokens.txt
+pool.yaml
