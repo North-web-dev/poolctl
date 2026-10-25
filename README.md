@@ -216,6 +216,53 @@ check:
   success_output: "200"
 ```
 
+## Health checks & cooldown
+
+Every token carries a status (`unknown` → `live` / `dead` / `quarantined`) and a
+`cooling_until` timestamp. These are driven by two things: the background health
+loop and what happens when a token is actually used.
+
+**Health loop.** On start and then every `recheck_interval_sec`, each token is
+validated with the configured `check`. A pass marks it `live` and clears its
+fail counter; a fail marks it `dead`. A passing check also *revives* a
+quarantined token. If `refresh.enabled` is set, a failing token's refresh
+endpoint is called and a new value swapped in.
+
+**Cooldown vs. quarantine.** `Take` always rests the token it hands out for
+`cooldown_sec`, which spreads load across the pool. On top of that, usage
+failures apply one of two penalties:
+
+| Signal | Action | Effect |
+|---|---|---|
+| `GET /take` success | cooldown | rests `cooldown_sec`, stays `live` |
+| `POST /release` `ok:false` (broker) | retire | marked `dead` |
+| `429` / `5xx` (gateway) | soft penalty | rests `upstream.cooldown_sec`, stays `live` |
+| `401` / `403` (gateway) | quarantine | pulled out for `quarantine_sec`, revived by a passing health check |
+| transport error (gateway) | soft penalty | rests `upstream.cooldown_sec`, stays `live` |
+
+A `dead`, `quarantined`, or still-cooling token is skipped by `Take` and by the
+proxy; if none are available, `/take` and the proxy return `503`. All of this is
+observable via `/status` and `/metrics`.
+
+## Limits
+
+Honest about what this is and is not:
+
+- **One upstream per proxy.** Gateway mode forwards to a single `base_url`; it
+  is not a general multi-host forward proxy.
+- **Single process.** State is in memory plus a JSON `state_file`; there is no
+  clustering or leader election. Run one instance per pool.
+- **No TLS on the listeners.** Terminate TLS in front of it (reverse proxy) or
+  keep it on localhost. Auth on the control API is a single shared `X-API-Key`,
+  and `/metrics` is always unauthenticated.
+- **Request bodies are buffered up to 32 MiB** so a request can be replayed on a
+  different token during a retry; larger bodies are truncated at that cap.
+  Response streaming (SSE) is unbounded.
+- **Plaintext credentials.** Token values live in `tokens_file` and are held in
+  memory; this is not a secret manager. Secure that file yourself.
+- **Best-effort rotation.** Cooldown uses the wall clock and `weighted` rotation
+  is probabilistic, not a strict scheduler.
+
 ## License
 
 MIT
@@ -227,3 +274,15 @@ credentials you supply and runs the health checks you configure. You are
 responsible for holding those credentials lawfully and for complying with the
 Terms of Service of any endpoint you check against. The authors accept no
 liability for misuse.
+
+## Support
+
+If `poolctl` saves you some time, a ⭐ on the repo is appreciated — and so is a tip:
+
+| Coin | Address |
+|---|---|
+| **BTC** | `bc1q0sfghv7yfl594gjurhyhlhdgm0dtwh4dkjha36` |
+| **ETH / USDT-ERC20 / BNB-BEP20** | `0xB827b5a8B6c5111946c5D872933b2C23484E87dE` |
+| **SOL** | `3ch5aHrPp3CierhiNXmqmtFH2dMHh6Gfv7a97KtLMMCh` |
+| **USDT-TRC20 / TRX** | `TUAyz7TjgJdFVD2oFHWUUTNrzzAnBRgySG` |
+| **TON** | `UQAJmYVuR3hh02etjaPKJF-h6jcpdSnq9ZIFvI64NEskS6tx` |

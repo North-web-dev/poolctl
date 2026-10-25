@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -375,7 +376,7 @@ func runTake(cfgPath string) error {
 		return err
 	}
 	if out.Error != "" {
-		return fmt.Errorf(out.Error)
+		return errors.New(out.Error)
 	}
 	fmt.Println(out.Token)
 	return nil
